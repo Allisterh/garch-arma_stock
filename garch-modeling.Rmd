@@ -1,0 +1,246 @@
+---
+title: 'GARCH Model Selection and Forecasting'
+output: html_document
+---
+
+
+Install and load packages and data.
+```{r}
+packages = c('forecast','quantmod','rugarch','urca','WeightedPortTest')
+for(package in packages){
+  if(!require(package,character.only=TRUE,quietly=TRUE)){
+    install.packages(package,repos='http://cran.us.r-project.org')
+    require(package,character.only=TRUE,quietly=TRUE)
+  }
+}
+rm(list = ls(all.names = TRUE))
+
+load("final.RData") 
+```
+
+```{r}
+#examine object names in RData file
+ls()
+```
+
+Yt object contains the daily returns of 4 assets in percentage form (for numerical stability) from 2011-
+01-04 to 2020-04-29. 
+Their ticker symbols can be found in the object `syb`.
+The first 3 companies, EOG Resources (EOG), Halliburton (HAL) and Chevron (CVX), are oil industry
+companies. The last one is Amazon (AMZN).
+
+
+Plotting each return series of Yt.
+```{r}
+ggtsdisplay(Yt[,"EOG"], main = "EOG")
+```
+
+
+```{r}
+ggtsdisplay(Yt[,"HAL"], main = "HAL")
+```
+
+```{r}
+ggtsdisplay(Yt[,"CVX"], main = "CVX")
+```
+
+
+```{r}
+ggtsdisplay(Yt[,"AMZN"], main = "AMZN")
+```
+
+The time series plots of the oil industry companies' returns appear almost exactly the same. They have the same appearance of no linear trend or intercept and a large amount of volatility around present day (oil prices have been volatile and fallen recently), which indicates GARCH effects may need to be taken into account. The time series and ACF plots of all the oil companies indicate stationarity because there are no apparent linear trends and the mean appears to be 0 (no intercept) and their ACFs have relatively fast decaying ACFs.
+
+The Amazon series has no such extreme volatility recently. But like the oil companies, it appears to have a mean of 0. Amazon's ACF shows evidence of white noise because almost all of its ACF are within the 95% bands.
+
+
+I'm choosing the Chevron (CVX) return series to model and analyze.
+
+```{r}
+Rt = Yt[,"CVX"]
+n = dim(Rt)[1] #sample size
+N = dim(Rt)[2] #number of assets
+```
+
+```{r}
+#plot CVX differenced series
+dYt = diff(Yt[,"CVX"])
+ggtsdisplay(dYt, main = "CVX")
+```
+
+The differenced series ACF shows fast decay of its ACF, which indicates the differenced series is stationary.
+
+There's no evidence of non-stationarity. ADF Unit root tests are unnecessary, but are shown below to confirm. 
+
+Using AIC:
+```{r}
+#run ADF tests on raw series
+p.max = trunc(12*(n/100)^0.25);cat("Maximum lags for the AIC:\t", p.max)
+
+
+DF = ur.df(Rt, type = "none", lag = p.max, selectlags = "AIC"); DF
+cat("The ADF statistic is:\t", DF@teststat[1],"\nModel with no drift or trend and
+lag parameter p =", DF@testreg$df[1]-2, "by the m-AIC");
+cat("\nCritical value:\n");DF@cval[1,]
+```
+
+Using BIC:
+```{r}
+DF = ur.df(Rt, type = "none", lag = p.max, selectlags = "BIC"); DF
+cat("The ADF statistic is:\t", DF@teststat[1],"\nModel with no drift or trend and
+lag parameter p =", DF@testreg$df[1]-2, "by the BIC");
+cat("\nCritical value:\n");DF@cval[1,]
+```
+
+ADF Unit root test H0 states: Series is non-stationary. 
+
+Raw series: Reject H0 because test statistic is more extreme than 5pct critical value, which indicates raw series is stationary I(0).
+
+```{r}
+KPSS = ur.kpss(Rt, type = "mu")
+cat("The KPSS statistic is:\t", KPSS@teststat);
+cat("The lag parameter of the Newey-West estimator is:\t", KPSS@lag);KPSS@cval
+```
+
+Do not reject H0: Series is stationary.
+
+Find a distribution that is the best fit from the t, skewed-t, GED, and skewed-GED distributions.
+
+```{r}
+dists = c("std", "sstd", "ged", "sged")
+fits = vector("list", 4)
+for(i in 1:4) fits[[i]] = fitdist(dists[i], Rt)
+
+AIC = vector("list", 4)
+BIC = vector("list", 4)
+loglik = vector("list", 4)
+for(i in 1:4){
+# negative log likelihood:
+  loglik[[i]] = fits[[i]]$values[length(fits[[i]]$values)]
+  p = 3
+  n = length(Rt)
+  AIC[i] = 2*loglik[[i]] + 2 * p
+  BIC[i] = 2*loglik[[i]] + log(n) * p
+  
+}
+names(loglik) = dists
+names(AIC) = dists
+names(BIC) = dists
+rbind(AIC, BIC)
+```
+
+AIC and BIC are non-negative. Skewed t-distribution minimizes AIC and BIC, so this appears to be the best distribution.
+
+```{r}
+#SSTD estimated parameters
+fits[[2]]$pars
+```
+
+
+```{r}
+s_Rt = sort(as.numeric(Rt))
+grid = (1:n)/(n+1)
+
+#QQ plot of GED
+qqplot(s_Rt, qdist("std",grid,mu=fits[[2]]$pars[1],sigma=fits[[2]]$pars[2],skew=fits[[2]]$pars[3],shape=fits[[2]]$pars[4]),main='Skewed-t Distribution QQ Plot for CVX',ylab='Daily Return',xlab='Skewed-t Quantile')
+
+lmfit = lm(qdist("std",c(.25,.75),mu=fits[[2]]$pars[1],sigma=fits[[2]]$pars[2],skew=fits[[2]]$pars[3],shape=fits[[2]]$pars[4]) ~ quantile(s_Rt,c(.25,.75)))
+
+abline(lmfit)
+```
+
+This fit appears to fit relatively well, with the exception of a few outliers.
+
+Fit an ARMA + GARCH
+
+```{r}
+k = 3
+aic = bic = matrix(ncol = k, nrow = k);
+dimnames(aic)[[1]] = dimnames(aic)[[2]] = as.character(0:(k-1))
+dimnames(bic)[[1]] = dimnames(bic)[[2]] = as.character(0:(k-1))
+for(i in 0:(k-1)){
+for(j in 0:(k-1)){
+out = arima(Rt[1:n,], order = c(i,0,j), include.mean = FALSE)
+aic[i+1,j+1] = out$aic
+bic[i+1,j+1] = -2*out$loglik + log(n)*(length(out$coef) + 1)
+}
+}
+cat("aic for p,q = 0,1,2:\n");aic;cat("\nmodel selected by aic:\t",
+paste(c("p","q"), which(aic == min(aic), arr.ind = T)-1, sep = " = "));
+cat("\nbic for p,q = 0,1,2:\n"); bic;cat("\nmodel selected by bic:\t",
+paste(c("p","q"), which(bic == min(bic), arr.ind = T)-1, sep = " = "));
+```
+
+AIC selects ARMA(2,2). BIC selects MA(2).
+
+```{r}
+#returns appear stationary, d=0
+fita = arima(Rt, order = c(2, 0, 2))
+cat("The model chosen by the AICc:\n"); fita
+fitb = arima(Rt, order = c(0, 0, 2))
+cat("\nThe model chosen by the BIC:\n"); fitb
+```
+
+```{r}
+autoplot_roots(phi = fita$model$phi, theta = fita$model$theta)
+```
+
+The ARMA(2,2) model has common roots, thus do not use. Move forward with MA(2) model.
+
+```{r}
+#check residuals
+DF = round(log(length(Rt)))
+checkresiduals(fitb, lag = DF + length(fitb$model$phi) + length(fitb$model$theta))
+```
+
+
+Ljung-Box and ACF show remaining correlation but that may be due to ARCH effects.
+
+```{r}
+ggtsdisplay(Rt^2, main = "CVX squared returns")
+```
+
+The squared returns ACF and PACF show significant remaining persistent autocorrelation, which further confirms GARCH is required.
+
+```{r}
+#compare standard GARCH and extended GARCH
+ic = ic.fun(Rt, arma = c(0,2), var.model = c("sGARCH", "eGARCH"), dist = c("sstd"))
+```
+
+AIC and BIC select eGarch (1,1)
+
+```{r}
+spec = ugarchspec(variance.model = list(model = "eGARCH", garchOrder = c(1,1)),
+                  mean.model = list(armaOrder = c(0,2), include.mean = F),
+                  distribution.model = "sstd")
+
+fit.bic = ugarchfit(Rt, spec = spec)
+showShort(fit.bic)
+```
+
+Ljung-Box and LM tests confirm no remaining correlation or ARCH effects. Final model is MA(2) + eGARCH(1,1) with estimates in above output.
+
+```{r}
+#check residuals
+plot(fit.bic,which=9)
+plot(fit.bic,which=10)
+plot(fit.bic,which=11)
+```
+
+Residuals fit distribution based on QQ plot. Only minor significant correlation left in standardized residuals. Squared standardized residuals still show some significant correlation, but none are significant before lag 8.
+
+Assuming today is 04-29-2020, use selected model to forecast tomorrow and day after tomorrow's returns (1-step and 2-step). Include both point and 95% interval forecasts.
+
+```{r}
+#point forecasts
+fore = ugarchforecast(fit.bic, n.ahead = 2)
+cat("h-step daily return forecast, h = 1-2:\n");fitted(fore);
+
+```
+
+```{r}
+#95% interval forecasts
+cri = qdist("std",p = .975, shape = coef(fit.bic)["shape"])
+cat("95% Prediction intervals:\n");cbind(fitted(fore)-cri*sigma(fore),
+fitted(fore)+sigma(fore))
+```
